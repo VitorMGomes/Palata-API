@@ -1,6 +1,6 @@
-import json, os, random, re, time
+import json, random, re, time
 from typing import Any, Dict, List, Optional
-
+from collections import OrderedDict
 from openai import OpenAI
 from src.config import (
     OPENAI_API_KEY, OPENAI_MODEL, OPENAI_FALLBACK_MODEL,
@@ -11,17 +11,15 @@ client = OpenAI(api_key=OPENAI_API_KEY)
 
 # ====== PREÇOS (USD por 1.000 tokens) ======
 OPENAI_PRICES = {
-    "gpt-4o-mini":   {"input": 0.00015, "output": 0.00060},
-    "gpt-4.1-mini":  {"input": 0.00020, "output": 0.00080},
-    # mantenha entradas extras aqui, se usar outros modelos:
-    # "gpt-4o":        {"input": 0.00500, "output": 0.01500},
+    "gpt-4o-mini":  {"input": 0.00015, "output": 0.00060},
+    "gpt-4.1-mini": {"input": 0.00020, "output": 0.00080},
+    # acrescente outros modelos se usar
 }
 
 # ====== CONTADORES GLOBAIS ======
 TOKEN_USAGE = {"input": 0, "output": 0, "cost": 0.0}
 
 def get_usage() -> Dict[str, float]:
-    """Retorna o uso acumulado (para o endpoint /usage)."""
     return {
         "input_tokens": TOKEN_USAGE["input"],
         "output_tokens": TOKEN_USAGE["output"],
@@ -29,12 +27,10 @@ def get_usage() -> Dict[str, float]:
     }
 
 def reset_usage() -> None:
-    """Zera o uso acumulado (se quiser expor isso em algum admin)."""
     TOKEN_USAGE.update({"input": 0, "output": 0, "cost": 0.0})
 
 # ====== HELPERS ======
 def _extract_text(msg_content) -> str:
-    # SDK v1 geralmente retorna string; mas suportamos lista/objetos por segurança
     if msg_content is None:
         return ""
     if isinstance(msg_content, str):
@@ -56,12 +52,21 @@ def _truncate(s: str, n: int) -> str:
 def _price_for(model: str) -> Dict[str, float]:
     return OPENAI_PRICES.get(model, {"input": 0.0, "output": 0.0})
 
+def _strip_md_fences(s: str) -> str:
+    """Remove cercas ```json ... ``` ou ``` ... ``` do modelo."""
+    s = s.strip()
+    s = re.sub(r"^\s*```(?:json)?\s*", "", s, flags=re.IGNORECASE)
+    s = re.sub(r"\s*```\s*$", "", s)
+    return s.strip()
+
 # ====== CORE ======
-def _chat_with_retry(messages: List[Dict[str, Any]], model: str, temperature: float = 0.0,
-                     max_retries: int = 4) -> str:
-    """
-    Chama a API com retries exponenciais; coleta tokens e custo; faz fallback de modelo no último retry.
-    """
+def _chat_with_retry(
+    messages: List[Dict[str, Any]],
+    model: str,
+    temperature: float = 0.0,
+    max_retries: int = 4,
+) -> str:
+    """Chama a API com retries; coleta tokens/custo; faz fallback no último retry."""
     for attempt in range(1, max_retries + 1):
         try:
             resp = client.chat.completions.create(
@@ -88,15 +93,20 @@ def _chat_with_retry(messages: List[Dict[str, Any]], model: str, temperature: fl
 
             content = resp.choices[0].message.content
             return _extract_text(content)
+
         except Exception as e:
-            # 429/5xx etc.: backoff exponencial + fallback de modelo na última tentativa
             sleep_s = (2 ** (attempt - 1)) + random.random()
             print(f"[OpenAI] erro '{type(e).__name__}' (tentativa {attempt}) → aguardando {sleep_s:.1f}s")
             if attempt == max_retries and model != OPENAI_FALLBACK_MODEL:
                 print(f"[OpenAI] trocando para fallback: {OPENAI_FALLBACK_MODEL}")
                 model = OPENAI_FALLBACK_MODEL
             time.sleep(sleep_s)
+
     raise RuntimeError("Falha ao completar com OpenAI após retries.")
+
+def _responses_with_retry(messages: List[Dict[str, Any]], *, temperature: float = 0.0) -> str:
+    """Wrapper padrão usando o modelo principal configurado."""
+    return _chat_with_retry(messages=messages, model=OPENAI_MODEL, temperature=temperature)
 
 # ====== API DE TRADUÇÃO ======
 async def translate_text(text: str) -> str:
@@ -105,17 +115,17 @@ async def translate_text(text: str) -> str:
     t = _truncate(text, MAX_TRANSLATION_CHARS)
     sys = "Traduza para PT-BR mantendo medidas e nomes próprios. Responda apenas com o texto traduzido."
     out = _chat_with_retry(
-        model=OPENAI_MODEL, temperature=0.2,
-        messages=[{"role":"system","content":sys},
-                  {"role":"user","content":t}]
+        model=OPENAI_MODEL,
+        temperature=0.2,
+        messages=[
+            {"role": "system", "content": sys},
+            {"role": "user", "content": t},
+        ],
     )
     return out.strip()
 
 async def translate_recipe_fields(detail: Dict[str, Any]) -> Dict[str, Optional[str]]:
-    """
-    Traduz título, resumo e instruções em UMA chamada.
-    Tenta JSON primeiro; se vier texto solto, ainda mapeia.
-    """
+    """Tradução em uma chamada → {titulo,resumo,instrucoes}."""
     title = detail.get("title") or ""
     summary = detail.get("summary") or ""
     instructions = detail.get("instructions") or ""
@@ -135,18 +145,19 @@ async def translate_recipe_fields(detail: Dict[str, Any]) -> Dict[str, Optional[
     }
 
     raw = _chat_with_retry(
-        model=OPENAI_MODEL, temperature=0.0,
-        messages=[{"role":"system","content":sys},
-                  {"role":"user","content":json.dumps(user_payload, ensure_ascii=False)}]
+        model=OPENAI_MODEL,
+        temperature=0.0,
+        messages=[
+            {"role": "system", "content": sys},
+            {"role": "user", "content": json.dumps(user_payload, ensure_ascii=False)},
+        ],
     ).strip()
 
     print("\n=== RAW OPENAI RESPONSE ===")
     print(raw[:1200])
     print("===========================\n")
 
-    # Remove cercas ```json ... ``` / ```
-    cleaned = re.sub(r"^\s*```(?:json)?\s*", "", raw, flags=re.IGNORECASE).strip()
-    cleaned = re.sub(r"\s*```\s*$", "", cleaned)
+    cleaned = _strip_md_fences(raw)
 
     # 1) JSON puro
     try:
@@ -172,3 +183,89 @@ async def translate_recipe_fields(detail: Dict[str, Any]) -> Dict[str, Optional[
         "resumo": pick(data, "resumo") or summary,
         "instrucoes": pick(data, "instrucoes", "instruções") or instructions,
     }
+
+# ====== LÓGICA DE TRADUÇÃO ESTRUTURAL (STRICT) ======
+def _is_url(s: str) -> bool:
+    return s.startswith("http://") or s.startswith("https://")
+
+def _is_image_like(s: str) -> bool:
+    s2 = s.lower()
+    return any(s2.endswith(ext) for ext in (".jpg", ".jpeg", ".png", ".gif", ".webp", ".svg"))
+
+async def _translate_batch(strings: list[str]) -> list[str]:
+    """Traduz uma lista de strings mantendo a ordem. Retorna lista do mesmo tamanho."""
+    if not strings:
+        return []
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "Você receberá um array JSON de strings. Traduza cada item para PT-BR e "
+                "retorne APENAS um array JSON com o MESMO número de itens, na MESMA ordem. "
+                "Não use markdown. Mantenha nomes próprios; traduza unidades culinárias."
+            ),
+        },
+        {"role": "user", "content": json.dumps(strings, ensure_ascii=False)},
+    ]
+    raw = _responses_with_retry(messages)
+    cleaned = _strip_md_fences(raw)
+    try:
+        arr = json.loads(cleaned)
+        if isinstance(arr, list) and len(arr) == len(strings):
+            return [("" if x is None else str(x)).strip() for x in arr]
+    except Exception:
+        pass
+    return strings  # fallback seguro
+
+async def translate_spoonacular_like_strict(obj: Any) -> Any:
+    """
+    Preserva a estrutura 1:1 do Spoonacular e traduz SOMENTE valores textuais relevantes.
+    Mantém ordem das chaves e não altera tipos (ids, números, URLs, etc.).
+    """
+    TRANSLATABLE_KEYS = {
+        "title", "name", "original", "originalName", "extendedName",
+        "aisle", "unitLong", "unitShort", "consistency", "summary", "instructions"
+    }
+
+    # 1) coletar caminhos + textos
+    paths: list[tuple] = []
+    texts: list[str] = []
+
+    def walk_collect(node: Any, path: tuple):
+        if isinstance(node, dict):
+            for k in node.keys():
+                v = node[k]
+                if isinstance(v, str) and (k in TRANSLATABLE_KEYS or k.lower() in TRANSLATABLE_KEYS):
+                    if not _is_url(v) and not _is_image_like(v):
+                        paths.append(path + (k,))
+                        texts.append(v)
+                walk_collect(v, path + (k,))
+        elif isinstance(node, list):
+            for i, item in enumerate(node):
+                walk_collect(item, path + (i,))
+
+    walk_collect(obj, ())
+
+    # 2) traduzir em lote
+    translated = await _translate_batch(texts)
+    it = iter(translated)
+
+    # 3) aplicar de volta preservando ordem
+    def walk_apply(node: Any, path: tuple) -> Any:
+        if isinstance(node, dict):
+            out = OrderedDict()
+            for k, v in node.items():
+                if isinstance(v, str) and (k in TRANSLATABLE_KEYS or k.lower() in TRANSLATABLE_KEYS):
+                    if not _is_url(v) and not _is_image_like(v):
+                        out[k] = next(it)
+                    else:
+                        out[k] = v
+                else:
+                    out[k] = walk_apply(v, path + (k,))
+            return out
+        elif isinstance(node, list):
+            return [walk_apply(x, path + (i,)) for i, x in enumerate(node)]
+        else:
+            return node
+
+    return walk_apply(obj, ())
