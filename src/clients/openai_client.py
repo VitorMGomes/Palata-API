@@ -269,3 +269,41 @@ async def translate_spoonacular_like_strict(obj: Any) -> Any:
             return node
 
     return walk_apply(obj, ())
+
+async def translate_ingredients_pt_to_en(ings: list[str]) -> list[str]:
+    """
+    Recebe ingredientes possivelmente em PT-BR e devolve em inglês, curtos e úteis
+    para busca (ex.: 'farinha de trigo' -> 'flour', 'cacau' -> 'cocoa powder').
+    Faz UMA chamada para traduzir a lista inteira.
+    """
+    if not ings:
+        return ings
+
+    # normaliza entrada visual (ex.: 'farinha_de_trigo' -> 'farinha de trigo')
+    clean = [ (i or "").replace("_", " ").strip() for i in ings ]
+
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "Você receberá um array JSON de ingredientes em PT-BR ou EN. "
+                "Converta cada item para INGLÊS, minúsculo, curto e apropriado para busca de receitas "
+                "(ex.: 'farinha de trigo' -> 'flour', 'cacau' -> 'cocoa powder', 'ovo' -> 'egg'). "
+                "Retorne APENAS um array JSON com o MESMO número de itens, na MESMA ordem, sem markdown."
+            ),
+        },
+        {"role": "user", "content": json.dumps(clean, ensure_ascii=False)},
+    ]
+
+    raw = _responses_with_retry(messages)
+    cleaned = _strip_md_fences(raw)
+
+    try:
+        arr = json.loads(cleaned)
+        if isinstance(arr, list) and len(arr) == len(clean):
+            return [ ("" if x is None else str(x)).lower().strip() for x in arr ]
+    except Exception:
+        pass
+
+    # fallback seguro: retorna strings normalizadas em minúsculo
+    return [ s.lower() for s in clean ]
